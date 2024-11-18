@@ -1,251 +1,334 @@
 using Azure.Messaging.ServiceBus;
 using CAT.App.D365.Service.Core.Models;
+using CAT.App.D365.Service.Core.Utilities.Interface;
+using DocumentFormat.OpenXml.Drawing;
+using Microsoft.Azure.Amqp.Framing;
 using Microsoft.Extensions.Configuration;
-using Microsoft.Identity.Client;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Net.Http;
-using System.Net.Http.Headers;
-using System.Text;
-using System.Threading.Tasks;
-using static System.Net.WebRequestMethods;
 using Polly;
 using Polly.Timeout;
-using DocumentFormat.OpenXml.Drawing;
+using System;
+using System.Collections.Generic;
+using System.Text.RegularExpressions;
 
 namespace CAT.App.D365.Service.Core.Utilities
 {
-    public class APICaller : IAPICaller
+    public class AzureServiceBusService : IAzureServiceBusService
     {
         private readonly IHttpClientFactory _clientFactory;
         private readonly IConfiguration _config;
-        private string _tenantId;
-        private string _scopeUrl;
-        private string _clientId;
-        private string _clientSecret;
-        private string _authority;
-        private string _authKey;
-        private string _authValue;
-        private string _fOBaseURL;
         private string _asbConnString;
-        private string _foCreateJournalEntryApiPath;
-        private AuthenticationResult result;
         private static readonly int maxRetryAttempts = 3;
         private static readonly TimeSpan pauseBetweenFailures = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan maxDelay = TimeSpan.FromSeconds(30);
 
-        public APICaller(IHttpClientFactory clientFactory, IConfiguration config)
+        private static readonly IAsyncPolicy PollyRetryPolicy = Policy
+            .Handle<Exception>()
+            .WaitAndRetryAsync(maxRetryAttempts, i => pauseBetweenFailures,
+                (exception, timeSpan, retryCount, context) =>
+                {
+                    Console.WriteLine($"Retry {retryCount} of {maxRetryAttempts}. Waiting {timeSpan} before next retry.");
+                });
+
+        private static readonly IAsyncPolicy PollyTimeOutPolicy = Policy
+            .TimeoutAsync(TimeSpan.FromSeconds(60), TimeoutStrategy.Pessimistic,(context, timespan, task) =>
+                {
+                    Console.WriteLine($"Timedout after {timespan.TotalSeconds} seconds.");
+                    return Task.CompletedTask; 
+                });
+
+        private static readonly IAsyncPolicy PollyPolicy = Policy.WrapAsync(PollyRetryPolicy, PollyTimeOutPolicy);
+
+        public AzureServiceBusService(IHttpClientFactory clientFactory, IConfiguration config)
         {
             _clientFactory = clientFactory;
             _config = config;
-            _tenantId = GetConfigValue("TenantId");
-            _clientId = GetConfigValue("OAuthClientId");
-            _clientSecret = GetConfigValue("OAuthClientSecret");
-            _scopeUrl = GetConfigValue("OAuthScopeUrl");
-            _authority = GetConfigValue("Authority");
-            _authKey = GetConfigValue("OAuthKey");
-            _authValue = GetConfigValue("OAuthValue");
-            _fOBaseURL = GetConfigValue("FinOpsApiBaseUrl");
-            _foCreateJournalEntryApiPath = GetConfigValue("CreateJournalEntryApiPath");
+            _asbConnString = GetConfigValue("ASBConnectionString");
         }
 
-        public async Task<HttpResponseMessage> APICallAsync(HttpMethod httpMethod, StringContent messageContent = null)
+        public async Task<string> ASBGetMessageApiCallAsync(string transactionType, IRequestCriteria? criteria)
         {
-            var client = _clientFactory.CreateClient();
-            client.DefaultRequestHeaders.Accept.Clear();
+            string queueName = string.Empty;
+            List<string> responseList = new List<string>();
+            bool stat = true;
 
-            var accessToken = GetAccessToken();
+            Dictionary<string, List<object>> respDict = new Dictionary<string, List<object>>();
 
-            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-            client.Timeout = TimeSpan.FromSeconds(240);
-            
-            if (client.BaseAddress == null) client.BaseAddress = new Uri(_fOBaseURL);
-
-            HttpRequestMessage request = new(httpMethod, _foCreateJournalEntryApiPath);
-            if (messageContent != null)
+            switch (transactionType.ToLower())
             {
-                request.Content = messageContent;
-                request.Content.Headers.ContentType = new MediaTypeWithQualityHeaderValue("application/json");
-            }
-            var response = await client.SendAsync(request);
-
-            return response;
-        }
-
-        public async Task<HttpResponseMessage> APICallAsync(Uri baseAddress, string APIpath, HttpMethod httpMethod, StringContent messageContent, string contentType, string authValue, string authKey, string SOAPAction = null)
-        {
-            var client = _clientFactory.CreateClient();
-            client.DefaultRequestHeaders.Accept.Clear();
-
-            client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue(contentType));
-            client.DefaultRequestHeaders.Add(_authKey, _authValue);
-
-            if (!string.IsNullOrEmpty(SOAPAction))
-            {
-                client.DefaultRequestHeaders.Add("SOAPAction", SOAPAction);
+                case "general":
+                    {
+                        queueName = GeneralConstants.GENERAL_JOURNAL_POSTED_QUEUENAME;
+                        break;
+                    }
+                case "emsfi":
+                    {
+                        queueName = GeneralConstants.EMSFI_JOURNAL_POSTED_QUEUENAME;
+                        break;
+                    }
+                case "notes":
+                    {
+                        queueName = GeneralConstants.NOTES_JOURNAL_POSTED_QUEUENAME;
+                        break;
+                    }
+                default:
+                    {
+                        queueName = GeneralConstants.GENERAL_JOURNAL_POSTED_QUEUENAME;
+                        break;
+                    }
             }
 
-            if (client.BaseAddress == null) client.BaseAddress = baseAddress;
+            await using ServiceBusClient client = new ServiceBusClient(_asbConnString);
 
-            var accessToken = await GetAccessTokenUsingMSAL();
-
-            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-
-            HttpRequestMessage request = new HttpRequestMessage(httpMethod, APIpath);
-            if (messageContent != null)
+            ServiceBusReceiverOptions receiverOptions = new ServiceBusReceiverOptions
             {
-                request.Content = messageContent;
-                request.Content.Headers.ContentType = new MediaTypeWithQualityHeaderValue(contentType);
-            }
-            var response = await client.SendAsync(request);
+                ReceiveMode = ServiceBusReceiveMode.PeekLock,
+                PrefetchCount = 10
+            };
 
-            return response;
-        }
-
-        public async Task<HttpResponseMessage> FinOpsApiCallAsync(HttpMethod httpMethod, string resourceUrl, StringContent messageContent)
-        {
-            var client = _clientFactory.CreateClient();
-            client.DefaultRequestHeaders.Accept.Clear();
-            
-            var accessToken = GetAccessToken();
-            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-            client.Timeout = TimeSpan.FromSeconds(240);
-
-            if (client.BaseAddress == null) client.BaseAddress = new Uri(_fOBaseURL);
-
-            HttpRequestMessage request = new HttpRequestMessage(httpMethod, resourceUrl);
-            if (messageContent != null)
-            {
-                request.Content = messageContent;
-                request.Content.Headers.ContentType = new MediaTypeWithQualityHeaderValue("application/json");
-            }
-
-            var foResponse = await client.SendAsync(request);
-            if (foResponse.IsSuccessStatusCode)
-            {
-                return foResponse;
-            }
-            else 
-            {
-                string responseString = foResponse.Content.ReadAsStringAsync().Result;
-                throw new Exception(responseString);
-            }
-        }
-
-        public async Task<HttpResponseMessage> UpdateFinOpsApiCallAsync(HttpMethod httpMethod, string resourceUrl, StringContent messageContent)
-        {
-            //Get Token
-            var client = _clientFactory.CreateClient();
-            client.DefaultRequestHeaders.Accept.Clear();
-            client.DefaultRequestHeaders.Add("Prefer", "return=representation");
-
-            var accessToken = GetAccessToken();
-            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-
-
-            if (client.BaseAddress == null) client.BaseAddress = new Uri(_fOBaseURL);
-
-            HttpRequestMessage request = new HttpRequestMessage(httpMethod, resourceUrl);
-            if (messageContent != null)
-            {
-                request.Content = messageContent;
-                request.Content.Headers.ContentType = new MediaTypeWithQualityHeaderValue("application/json");
-            }
-
-            var foResponse = client.SendAsync(request).Result;
-            if (foResponse.IsSuccessStatusCode)
-            {
-                return foResponse;
-            }
-            else
-            {
-                string responseString = foResponse.Content.ReadAsStringAsync().Result;
-                return foResponse;
-            }
-        }
-
-        private string GetAccessToken()
-        {
-            var authority = $"{_authority}{_tenantId}";
-            var app = ConfidentialClientApplicationBuilder.Create(_clientId)
-                .WithClientSecret(_clientSecret)
-                .WithAuthority(authority)
-                .Build();
-            var scopes = new string[] { $"{_scopeUrl}" };
-            var authResult = app.AcquireTokenForClient(scopes).ExecuteAsync().Result;
-
-            if (authResult == null)
-            {
-                throw new InvalidOperationException("Failed to obtain the JWT token");
-            }
-            return authResult.AccessToken;
-        }
-
-        private async Task<string> GetAuthTokenUsingClientCredentialsHttpAsync()
-        {
-            HttpClient client = new HttpClient();
-            string tokenEndpoint = $"https://login.microsoftonline.com/{_tenantId}/oauth2/token";
-
-            var body = $"client_id={_clientId}&grant_type=client_credentials&client_secret={_clientSecret}";
-
-            Console.WriteLine($"token request body {body}");
-
-            var stringContent = new StringContent(body, Encoding.UTF8, "application/x-www-form-urlencoded");
-
-            Console.WriteLine("Making a token call...");
-
-            var result = await client.PostAsync(tokenEndpoint, stringContent).ContinueWith<string>((response) =>
-            {
-                return response.Result.Content.ReadAsStringAsync().Result;
-            });
-
-            Console.WriteLine($"Token received...{result.ToString()}");
-
-            JObject jobject = JObject.Parse(result);
-
-            var token = jobject["access_token"].Value<string>();
-            return token;
-        }
-
-        private async Task<string> GetAccessTokenUsingMSAL()
-        {
-            IConfidentialClientApplication app;
-
-            var authority = $"{_authority}{_tenantId}";
-
-            string[] scopes = new string[] { _scopeUrl };
-
-            app = ConfidentialClientApplicationBuilder.Create(_clientId)
-                                                      .WithClientSecret(_clientSecret)
-                                                      .WithAuthority(new Uri(authority))
-                                                      .Build();
+            ServiceBusReceiver serviceBusReceiver = client.CreateReceiver(queueName, receiverOptions);
 
             try
             {
-                if (result == null || result.ExpiresOn <= DateTimeOffset.UtcNow)
+                while (stat)
                 {
-                    result = await app.AcquireTokenForClient(scopes)
-                                      .ExecuteAsync();
-                }
+                    await PollyPolicy.ExecuteAsync(async () =>
+                    {
+                        ServiceBusReceivedMessage peekMessage = await serviceBusReceiver.PeekMessageAsync();
+                        if (peekMessage != null)
+                        {
+                            MessageTypeModel? processMessage = IsMessageForProcessing(transactionType, criteria, peekMessage.Body.ToString()); //Use peekMessage.Body.ToString()!
+                            if (processMessage != null && processMessage.MessageBody != null)
+                            {
+                                ProcessResponseDictionary(transactionType, processMessage, respDict, peekMessage.Body);
 
-                return result.AccessToken.ToString();
+                                ServiceBusReceivedMessage receiveMessage = await serviceBusReceiver.ReceiveMessageAsync();
+                                if (receiveMessage != null)
+                                {
+                                    responseList.Add(receiveMessage.Body.ToString());
+                                    await serviceBusReceiver.CompleteMessageAsync(receiveMessage);
+                                }
+                            }
+                        }
+                        else
+                        {
+                            stat = false;
+                        }
+                    });
+                }
             }
-            catch (MsalThrottledServiceException ex)
+            catch (TimeoutRejectedException timeoutEx)
             {
-                throw new Exception("Token cannot be obtained due to", ex);
+                throw new TimeoutRejectedException(timeoutEx.Message);
             }
             catch (Exception ex)
             {
-                throw new Exception("Token cannot be obtained due to", ex);
+                throw new Exception(ex.Message);
             }
+            finally
+            {
+                {
+                    await serviceBusReceiver.DisposeAsync();
+                    await client.DisposeAsync();
+                }
+            }
+
+            return JsonConvert.SerializeObject(respDict);
+        }
+
+        public async Task<List<string>> ASBGetMessageAPICallAsync(string criteria)
+        {
+            var responseList = new List<string>();
+            return responseList;
+        }
+
+        public async Task<string> ASBSendMessageApiCallAsync(string asbMessage)
+        {
+            string returnMessage = string.Empty;
+            var retryPolicy = Policy
+                .Handle<Exception>()
+                .WaitAndRetryAsync(maxRetryAttempts, i => pauseBetweenFailures,
+                    (exception, timeSpan, retryCount, context) =>
+                    {
+                        Console.WriteLine($"Retry {retryCount} of {maxRetryAttempts}. Waiting {timeSpan} before next retry. Retrying due to: {exception.Message}");
+                    });
+
+            var clientOptions = new ServiceBusClientOptions
+            {
+                RetryOptions = new ServiceBusRetryOptions
+                {
+                    Mode = ServiceBusRetryMode.Exponential,
+                    MaxRetries = maxRetryAttempts,
+                    Delay = pauseBetweenFailures,
+                    MaxDelay = maxDelay
+                }
+            };
+
+            await using ServiceBusClient serviceBusClient = new ServiceBusClient(_asbConnString, clientOptions);
+            
+            ServiceBusSender serviceBusSender = serviceBusClient.CreateSender(GeneralConstants.GENERAL_JOURNAL_POSTED_QUEUENAME);
+
+            await retryPolicy.ExecuteAsync(async () =>
+            {
+                ServiceBusMessage message = new ServiceBusMessage(asbMessage);
+                
+                await serviceBusSender.SendMessageAsync(message);
+
+                returnMessage = $"Message sent successfully. Message Details: {asbMessage}";
+
+                await serviceBusSender.CloseAsync();
+            });
+
+            return returnMessage;
+        }
+
+        public async Task<string> ASBSendBatchMessageApiCallAsync(string asbMessage, string transactionType)
+        {
+            string returnMessage = string.Empty;
+            string queueName = string.Empty;
+
+            dynamic? messages = JsonConvert.DeserializeObject<dynamic>(asbMessage);
+            List<string> sentMessage = new List<string>();
+            var retryPolicy = Policy
+                .Handle<Exception>()
+                .WaitAndRetryAsync(maxRetryAttempts, i => pauseBetweenFailures,
+                    (exception, timeSpan, retryCount, context) =>
+                    {
+                        Console.WriteLine($"Retry {retryCount} of {maxRetryAttempts}. Waiting {timeSpan} before next retry. Retrying due to: {exception.Message}");
+                    });
+
+            var clientOptions = new ServiceBusClientOptions
+            {
+                RetryOptions = new ServiceBusRetryOptions
+                {
+                    Mode = ServiceBusRetryMode.Exponential,
+                    MaxRetries = maxRetryAttempts,
+                    Delay = pauseBetweenFailures,
+                    MaxDelay = maxDelay
+                }
+            };
+
+            await using ServiceBusClient serviceBusClient = new ServiceBusClient(_asbConnString, clientOptions);
+            switch (transactionType.ToLower())
+            {
+                case "general":
+                    {
+                        queueName = GeneralConstants.GENERAL_JOURNAL_POSTED_QUEUENAME;
+                        break;
+                    }
+                case "emsfi":
+                    {
+                        queueName = GeneralConstants.EMSFI_JOURNAL_POSTED_QUEUENAME;
+                        break;
+                    }
+                case "notes":
+                    {
+                        queueName = GeneralConstants.NOTES_JOURNAL_POSTED_QUEUENAME;
+                        break;
+                    }
+                default:
+                    {
+                        queueName = GeneralConstants.GENERAL_JOURNAL_POSTED_QUEUENAME;
+                        break;
+                    }
+            }
+            ServiceBusSender serviceBusSender = serviceBusClient.CreateSender(queueName);
+
+            await retryPolicy.ExecuteAsync(async () =>
+            {
+                ServiceBusMessage message = new ServiceBusMessage(asbMessage);
+                using ServiceBusMessageBatch messageBatch = await serviceBusSender.CreateMessageBatchAsync();
+                foreach (var messageContent in messages.requestData)
+                {
+                    if (!messageBatch.TryAddMessage(new ServiceBusMessage(messageContent.ToString())))
+                    {
+                        throw new Exception("The message is too large to fit in the batch.");
+                    }
+                    sentMessage.Add(messageContent.ToString());
+                }
+
+                await serviceBusSender.SendMessagesAsync(messageBatch);
+                string successfullySentMessages = JsonConvert.SerializeObject(sentMessage);
+                returnMessage = $"Message sent successfully. Message Details: {successfullySentMessages}";
+
+                await serviceBusSender.CloseAsync();
+            });
+
+            return returnMessage;
         }
 
         private string GetConfigValue(string setting)
         {
             return _config[$"AppSettings:{setting}"] ?? _config[setting];
-            //return _config.GetSection("AppSettings").GetValue<string>(setting) ?? _config.GetValue<string>(setting);
         }
+
+        private MessageTypeModel? IsMessageForProcessing(string transactionType, IRequestCriteria? criteria, string targetMsg)
+        {
+            try
+            {
+                MessageTypeModel result;
+                if (criteria != null && transactionType.ToLower() != TransactionTypes.GENERAL.ToLower())
+                {
+                    var sbResponse = JsonConvert.DeserializeObject<ServiceBusMessageResponse>(targetMsg);
+                    var target = MessageProcessorHelper.ConvertToDictionary(sbResponse);
+
+                    if (target == null)
+                        return null;
+
+                    var criteriaDict = MessageProcessorHelper.ConvertCriteriaToDictionary(transactionType, criteria);
+                    var flatCriteria = MessageProcessorHelper.FlattenCriteria(criteriaDict);
+
+                    var match = MessageProcessorHelper.GetMatches(flatCriteria, target);
+
+                    result = new MessageTypeModel()
+                    {
+                        TransactionType = transactionType,
+                        TransactionStatus = match.FirstOrDefault().Key,
+                        MessageBody = match.FirstOrDefault().Value
+                    };
+                }
+                else //general
+                {
+                    result = new MessageTypeModel()
+                    {
+                        TransactionType = transactionType,
+                        TransactionStatus = transactionType,
+                        MessageBody = JsonConvert.DeserializeObject<object?>(targetMsg)
+                    };
+                }
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                return null;
+            }
+        }
+
+        private void ProcessResponseDictionary(string transactionType, MessageTypeModel? processMessage, Dictionary<string, List<object>> respDict, object messageBody)
+        {
+            switch (transactionType)
+            {
+                case TransactionTypes.NOTES:
+                case TransactionTypes.EMSFI:
+                    if (respDict.ContainsKey(processMessage.TransactionStatus))
+                        respDict[processMessage.TransactionStatus].Add(JsonConvert.DeserializeObject(processMessage.MessageBody.ToString()));
+                    else
+                        respDict[processMessage.TransactionStatus] = new List<object> { JsonConvert.DeserializeObject(processMessage.MessageBody.ToString()) };
+                    break;
+                case TransactionTypes.GENERAL:
+                    if (respDict.ContainsKey(TransactionTypes.GENERAL))
+                        respDict[TransactionTypes.GENERAL].Add(JsonConvert.DeserializeObject(messageBody.ToString()));
+                    else
+                        respDict[TransactionTypes.GENERAL] = new List<object> { JsonConvert.DeserializeObject(messageBody.ToString()) };
+                    break;
+                default:
+                    break;
+            }
+            
+
+        }
+
     }
 }
