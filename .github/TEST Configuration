@@ -1,3 +1,4 @@
+using CAT.App.D365.Service.Core.Models;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -6,12 +7,10 @@ using System.Threading.Tasks;
 
 namespace CAT.App.D365.Service.Core.Utilities.Interface
 {
-    public interface IAzureServiceBusService
+    public interface ILiquidTemplateService
     {
-        Task<string> ASBGetMessageApiCallAsync(string transactionType, IRequestCriteria? criteria);
+        Task<string> GetLiquidTemplateAsync(string messageRequest, string templateName);
 
-        Task<string> ASBSendMessageApiCallAsync(string asbMessage);
-
-        Task<string> ASBSendBatchMessageApiCallAsync(string asbMessage, string transactionType);
+        Task<string> GetLiquidTemplateAsync(string messageRequest, string templateName, string dataArea);
     }
 }
