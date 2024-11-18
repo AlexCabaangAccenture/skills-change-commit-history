@@ -1,18 +1,17 @@
-using CAT.App.D365.Service.Core.Models;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 
-namespace CAT.App.D365.Service.Core.Utilities
+namespace CAT.App.D365.Service.Core.Utilities.Interface
 {
-    public interface IAPICaller
+    public interface IAzureServiceBusService
     {
-        Task<HttpResponseMessage> APICallAsync(HttpMethod httpMethod, StringContent messageContent = null);
-        Task<HttpResponseMessage> APICallAsync(Uri baseAddress, string APIpath, HttpMethod httpMethod, StringContent messageContent, string contentType, string authValue, string authKey, string SOAPAction = null);
-        Task<HttpResponseMessage> FinOpsApiCallAsync(HttpMethod httpMethod, string resourceUrl, StringContent messageContent = null);
+        Task<string> ASBGetMessageApiCallAsync(string transactionType, IRequestCriteria? criteria);
 
-        Task<HttpResponseMessage> UpdateFinOpsApiCallAsync(HttpMethod httpMethod, string resourceUrl, StringContent messageContent);
+        Task<string> ASBSendMessageApiCallAsync(string asbMessage);
+
+        Task<string> ASBSendBatchMessageApiCallAsync(string asbMessage, string transactionType);
     }
 }
