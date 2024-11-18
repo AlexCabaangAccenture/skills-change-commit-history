@@ -1,14 +1,251 @@
+using Azure.Messaging.ServiceBus;
 using CAT.App.D365.Service.Core.Models;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Identity.Client;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Threading.Tasks;
+using static System.Net.WebRequestMethods;
+using Polly;
+using Polly.Timeout;
+using DocumentFormat.OpenXml.Drawing;
 
 namespace CAT.App.D365.Service.Core.Utilities
 {
-    public interface IStorageAccountService
+    public class APICaller : IAPICaller
     {
-        Task<string> GetLiquidTemplateAsync(BlobInformation blobInformation);
+        private readonly IHttpClientFactory _clientFactory;
+        private readonly IConfiguration _config;
+        private string _tenantId;
+        private string _scopeUrl;
+        private string _clientId;
+        private string _clientSecret;
+        private string _authority;
+        private string _authKey;
+        private string _authValue;
+        private string _fOBaseURL;
+        private string _asbConnString;
+        private string _foCreateJournalEntryApiPath;
+        private AuthenticationResult result;
+        private static readonly int maxRetryAttempts = 3;
+        private static readonly TimeSpan pauseBetweenFailures = TimeSpan.FromSeconds(5);
+
+        public APICaller(IHttpClientFactory clientFactory, IConfiguration config)
+        {
+            _clientFactory = clientFactory;
+            _config = config;
+            _tenantId = GetConfigValue("TenantId");
+            _clientId = GetConfigValue("OAuthClientId");
+            _clientSecret = GetConfigValue("OAuthClientSecret");
+            _scopeUrl = GetConfigValue("OAuthScopeUrl");
+            _authority = GetConfigValue("Authority");
+            _authKey = GetConfigValue("OAuthKey");
+            _authValue = GetConfigValue("OAuthValue");
+            _fOBaseURL = GetConfigValue("FinOpsApiBaseUrl");
+            _foCreateJournalEntryApiPath = GetConfigValue("CreateJournalEntryApiPath");
+        }
+
+        public async Task<HttpResponseMessage> APICallAsync(HttpMethod httpMethod, StringContent messageContent = null)
+        {
+            var client = _clientFactory.CreateClient();
+            client.DefaultRequestHeaders.Accept.Clear();
+
+            var accessToken = GetAccessToken();
+
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+            client.Timeout = TimeSpan.FromSeconds(240);
+            
+            if (client.BaseAddress == null) client.BaseAddress = new Uri(_fOBaseURL);
+
+            HttpRequestMessage request = new(httpMethod, _foCreateJournalEntryApiPath);
+            if (messageContent != null)
+            {
+                request.Content = messageContent;
+                request.Content.Headers.ContentType = new MediaTypeWithQualityHeaderValue("application/json");
+            }
+            var response = await client.SendAsync(request);
+
+            return response;
+        }
+
+        public async Task<HttpResponseMessage> APICallAsync(Uri baseAddress, string APIpath, HttpMethod httpMethod, StringContent messageContent, string contentType, string authValue, string authKey, string SOAPAction = null)
+        {
+            var client = _clientFactory.CreateClient();
+            client.DefaultRequestHeaders.Accept.Clear();
+
+            client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue(contentType));
+            client.DefaultRequestHeaders.Add(_authKey, _authValue);
+
+            if (!string.IsNullOrEmpty(SOAPAction))
+            {
+                client.DefaultRequestHeaders.Add("SOAPAction", SOAPAction);
+            }
+
+            if (client.BaseAddress == null) client.BaseAddress = baseAddress;
+
+            var accessToken = await GetAccessTokenUsingMSAL();
+
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+            HttpRequestMessage request = new HttpRequestMessage(httpMethod, APIpath);
+            if (messageContent != null)
+            {
+                request.Content = messageContent;
+                request.Content.Headers.ContentType = new MediaTypeWithQualityHeaderValue(contentType);
+            }
+            var response = await client.SendAsync(request);
+
+            return response;
+        }
+
+        public async Task<HttpResponseMessage> FinOpsApiCallAsync(HttpMethod httpMethod, string resourceUrl, StringContent messageContent)
+        {
+            var client = _clientFactory.CreateClient();
+            client.DefaultRequestHeaders.Accept.Clear();
+            
+            var accessToken = GetAccessToken();
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+            client.Timeout = TimeSpan.FromSeconds(240);
+
+            if (client.BaseAddress == null) client.BaseAddress = new Uri(_fOBaseURL);
+
+            HttpRequestMessage request = new HttpRequestMessage(httpMethod, resourceUrl);
+            if (messageContent != null)
+            {
+                request.Content = messageContent;
+                request.Content.Headers.ContentType = new MediaTypeWithQualityHeaderValue("application/json");
+            }
+
+            var foResponse = await client.SendAsync(request);
+            if (foResponse.IsSuccessStatusCode)
+            {
+                return foResponse;
+            }
+            else 
+            {
+                string responseString = foResponse.Content.ReadAsStringAsync().Result;
+                throw new Exception(responseString);
+            }
+        }
+
+        public async Task<HttpResponseMessage> UpdateFinOpsApiCallAsync(HttpMethod httpMethod, string resourceUrl, StringContent messageContent)
+        {
+            //Get Token
+            var client = _clientFactory.CreateClient();
+            client.DefaultRequestHeaders.Accept.Clear();
+            client.DefaultRequestHeaders.Add("Prefer", "return=representation");
+
+            var accessToken = GetAccessToken();
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+
+            if (client.BaseAddress == null) client.BaseAddress = new Uri(_fOBaseURL);
+
+            HttpRequestMessage request = new HttpRequestMessage(httpMethod, resourceUrl);
+            if (messageContent != null)
+            {
+                request.Content = messageContent;
+                request.Content.Headers.ContentType = new MediaTypeWithQualityHeaderValue("application/json");
+            }
+
+            var foResponse = client.SendAsync(request).Result;
+            if (foResponse.IsSuccessStatusCode)
+            {
+                return foResponse;
+            }
+            else
+            {
+                string responseString = foResponse.Content.ReadAsStringAsync().Result;
+                return foResponse;
+            }
+        }
+
+        private string GetAccessToken()
+        {
+            var authority = $"{_authority}{_tenantId}";
+            var app = ConfidentialClientApplicationBuilder.Create(_clientId)
+                .WithClientSecret(_clientSecret)
+                .WithAuthority(authority)
+                .Build();
+            var scopes = new string[] { $"{_scopeUrl}" };
+            var authResult = app.AcquireTokenForClient(scopes).ExecuteAsync().Result;
+
+            if (authResult == null)
+            {
+                throw new InvalidOperationException("Failed to obtain the JWT token");
+            }
+            return authResult.AccessToken;
+        }
+
+        private async Task<string> GetAuthTokenUsingClientCredentialsHttpAsync()
+        {
+            HttpClient client = new HttpClient();
+            string tokenEndpoint = $"https://login.microsoftonline.com/{_tenantId}/oauth2/token";
+
+            var body = $"client_id={_clientId}&grant_type=client_credentials&client_secret={_clientSecret}";
+
+            Console.WriteLine($"token request body {body}");
+
+            var stringContent = new StringContent(body, Encoding.UTF8, "application/x-www-form-urlencoded");
+
+            Console.WriteLine("Making a token call...");
+
+            var result = await client.PostAsync(tokenEndpoint, stringContent).ContinueWith<string>((response) =>
+            {
+                return response.Result.Content.ReadAsStringAsync().Result;
+            });
+
+            Console.WriteLine($"Token received...{result.ToString()}");
+
+            JObject jobject = JObject.Parse(result);
+
+            var token = jobject["access_token"].Value<string>();
+            return token;
+        }
+
+        private async Task<string> GetAccessTokenUsingMSAL()
+        {
+            IConfidentialClientApplication app;
+
+            var authority = $"{_authority}{_tenantId}";
+
+            string[] scopes = new string[] { _scopeUrl };
+
+            app = ConfidentialClientApplicationBuilder.Create(_clientId)
+                                                      .WithClientSecret(_clientSecret)
+                                                      .WithAuthority(new Uri(authority))
+                                                      .Build();
+
+            try
+            {
+                if (result == null || result.ExpiresOn <= DateTimeOffset.UtcNow)
+                {
+                    result = await app.AcquireTokenForClient(scopes)
+                                      .ExecuteAsync();
+                }
+
+                return result.AccessToken.ToString();
+            }
+            catch (MsalThrottledServiceException ex)
+            {
+                throw new Exception("Token cannot be obtained due to", ex);
+            }
+            catch (Exception ex)
+            {
+                throw new Exception("Token cannot be obtained due to", ex);
+            }
+        }
+
+        private string GetConfigValue(string setting)
+        {
+            return _config[$"AppSettings:{setting}"] ?? _config[setting];
+            //return _config.GetSection("AppSettings").GetValue<string>(setting) ?? _config.GetValue<string>(setting);
+        }
     }
 }
